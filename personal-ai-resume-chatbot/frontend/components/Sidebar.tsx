@@ -17,6 +17,7 @@ const links = [
   { label: "Resume", href: profile.links.resume },
   { label: "GitHub", href: profile.links.github },
   { label: "LinkedIn", href: profile.links.linkedin },
+  { label: "Codolio", href: profile.links.codolio },
   { label: "Portfolio", href: profile.links.portfolio },
 ].filter((l) => l.href.trim() !== "");
 

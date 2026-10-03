@@ -8,6 +8,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from groq import Groq
 from pydantic import BaseModel
 from pypdf import PdfReader
@@ -21,6 +22,10 @@ if not _api_key:
 
 client = Groq(api_key=_api_key)
 model = "openai/gpt-oss-120b"
+
+# Optional: set CHAT_REASONING_EFFORT=low (or medium/high) in .env or on Render
+# to make the model think less before answering. Empty = model default.
+CHAT_REASONING_EFFORT = os.getenv("CHAT_REASONING_EFFORT", "").strip()
 
 # Resume path is relative to this file, so it works from any folder
 BASE_DIR = Path(__file__).resolve().parent
@@ -136,7 +141,7 @@ def parse_resume(resume_text):
 
 
 # ---------- Chat ----------
-def ask_candidate(question: str, resume: Resume, history: list[ChatMessage]):
+def build_chat_messages(question: str, resume: Resume, history: list[ChatMessage]):
     system_prompt = f"""
 You are an AI assistant on a portfolio website. You represent the candidate
 below and talk to recruiters and HR.
@@ -164,9 +169,25 @@ Rules:
         if m.role in ("user", "assistant"):
             messages.append({"role": m.role, "content": m.content[:4000]})
     messages.append({"role": "user", "content": question})
+    return messages
 
+
+def ask_candidate(question: str, resume: Resume, history: list[ChatMessage]):
+    """Normal (non-streaming) answer. Kept as a fallback for /chat."""
+    messages = build_chat_messages(question, resume, history)
     response = client.chat.completions.create(model=model, messages=messages)
     return response.choices[0].message.content
+
+
+def stream_candidate(question: str, resume: Resume, history: list[ChatMessage]):
+    """Opens a streaming request to Groq; returns an iterator of chunks."""
+    messages = build_chat_messages(question, resume, history)
+    extra = {}
+    if CHAT_REASONING_EFFORT:
+        extra["reasoning_effort"] = CHAT_REASONING_EFFORT
+    return client.chat.completions.create(
+        model=model, messages=messages, stream=True, **extra
+    )
 
 
 # ---------- Job description matching ----------
@@ -246,8 +267,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Personal AI Resume Chatbot", lifespan=lifespan)
 
 # Local development addresses are always allowed.
-# On Render, set ALLOWED_ORIGINS to your Vercel URL(s), comma-separated, e.g.
-# "https://your-site.vercel.app"
+# On Render, set ALLOWED_ORIGINS to your Vercel URL(s), comma-separated.
 DEFAULT_DEV_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
@@ -280,8 +300,8 @@ def health():
     return {"status": "ok", "resume_loaded": resume is not None}
 
 
-@app.post("/chat")
-def chat(request: ChatRequest, http_request: Request):
+def prepare_chat(request: ChatRequest, http_request: Request) -> str:
+    """Shared checks for /chat and /chat/stream. Returns the cleaned message."""
     check_rate_limit(http_request)
     text = (request.message or request.question or "").strip()
     if not text:
@@ -290,11 +310,48 @@ def chat(request: ChatRequest, http_request: Request):
         raise HTTPException(status_code=400, detail="Message is too long.")
     if resume is None:
         raise HTTPException(status_code=503, detail="Resume not loaded yet.")
+    return text
+
+
+@app.post("/chat")
+def chat(request: ChatRequest, http_request: Request):
+    text = prepare_chat(request, http_request)
     try:
         answer = ask_candidate(text, resume, request.history)
     except Exception:
         raise HTTPException(status_code=502, detail="The AI service failed. Try again.")
     return {"answer": answer}
+
+
+@app.post("/chat/stream")
+def chat_stream(request: ChatRequest, http_request: Request):
+    text = prepare_chat(request, http_request)
+
+    # Open the connection to Groq BEFORE replying, so a failure becomes a
+    # proper error response instead of a half-empty stream.
+    try:
+        groq_stream = stream_candidate(text, resume, request.history)
+    except Exception:
+        raise HTTPException(status_code=502, detail="The AI service failed. Try again.")
+
+    def token_generator():
+        try:
+            for chunk in groq_stream:
+                if not chunk.choices:
+                    continue
+                piece = chunk.choices[0].delta.content
+                if piece:
+                    yield piece
+        except Exception:
+            # Connection broke mid-answer: just end the stream.
+            # The frontend keeps whatever text already arrived.
+            return
+
+    return StreamingResponse(
+        token_generator(),
+        media_type="text/plain; charset=utf-8",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 @app.post("/match")

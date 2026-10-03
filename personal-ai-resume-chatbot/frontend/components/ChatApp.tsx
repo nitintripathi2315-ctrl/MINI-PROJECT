@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
-import { ApiError, matchJob, sendMessage, warmUpServer } from "@/lib/api";
+import { ApiError, matchJob, streamMessage, warmUpServer } from "@/lib/api";
 import { looksLikeJobDescription } from "@/lib/jd";
 import { profile } from "@/lib/profile";
 import type { Prompt } from "@/lib/prompts";
@@ -29,7 +29,8 @@ export default function ChatApp() {
   const [input, setInput] = useState("");
   const [loading, setLoading] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
-    useEffect(() => {
+
+  useEffect(() => {
     warmUpServer();
   }, []);
 
@@ -59,12 +60,30 @@ export default function ChatApp() {
             { id: newId(), role: "assistant", content: summarize(result), jobMatch: result },
           ]);
         } else {
-          const answer = await sendMessage(text, history);
+          // Streamed answer: the assistant message appears with the first words
+          // and keeps growing until the answer is complete.
+          const assistantId = newId();
+          let started = false;
+
+          const answer = await streamMessage(text, history, (partial) => {
+            if (!isCurrent()) return;
+            if (!started) {
+              started = true;
+              setMessages((prev) => [
+                ...prev,
+                { id: assistantId, role: "assistant", content: partial },
+              ]);
+            } else {
+              setMessages((prev) =>
+                prev.map((m) => (m.id === assistantId ? { ...m, content: partial } : m))
+              );
+            }
+          });
+
           if (!isCurrent()) return;
-          setMessages((prev) => [
-            ...prev,
-            { id: newId(), role: "assistant", content: answer },
-          ]);
+          setMessages((prev) =>
+            prev.map((m) => (m.id === assistantId ? { ...m, content: answer } : m))
+          );
         }
       } catch (err) {
         if (!isCurrent()) return;

@@ -28,10 +28,17 @@ export default function ChatWindow({
 }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null);
 
-  // Smoothly scroll to the newest message
+  // Follow the newest text. Instant while the answer streams in, smooth otherwise.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+    bottomRef.current?.scrollIntoView({
+      behavior: loading ? "auto" : "smooth",
+      block: "end",
+    });
   }, [messages, loading]);
+
+  // Show the bouncing dots only until the first words of the answer arrive
+  const last = messages[messages.length - 1];
+  const waitingForFirstWord = loading && last?.role === "user";
 
   return (
     <div className="flex min-h-0 flex-1 flex-col">
@@ -43,7 +50,7 @@ export default function ChatWindow({
             {messages.map((m) => (
               <ChatMessage key={m.id} message={m} />
             ))}
-            {loading && <TypingIndicator />}
+            {waitingForFirstWord && <TypingIndicator />}
             <div ref={bottomRef} />
           </div>
         )}
