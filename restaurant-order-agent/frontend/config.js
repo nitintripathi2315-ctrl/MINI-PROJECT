@@ -1,1 +1,1 @@
-window.API_URL = "https://YOUR-SERVICE-NAME.onrender.com";
+window.API_URL = "https://mini-project-c6f5.onrender.com";
