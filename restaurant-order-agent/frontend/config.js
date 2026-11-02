@@ -1,1 +1,1 @@
-window.API_URL = "http://localhost:8000";
+window.API_URL = "https://YOUR-SERVICE-NAME.onrender.com";
