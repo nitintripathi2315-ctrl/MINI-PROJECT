@@ -57,53 +57,90 @@
 const API = (window.API_URL || "").replace(/\/$/, "");
 const chat = document.getElementById("chat"), input = document.getElementById("input"),
       sendBtn = document.getElementById("send"), form = document.getElementById("form");
-let sessionId = null, busy = false;
+let sessionId = null, busy = false, queue = Promise.resolve();
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+function enqueue(fn) { queue = queue.then(fn).catch(console.error); return queue; }  // keeps display in order
 
 function add(cls, text) {
   const d = document.createElement("div");
   d.className = cls; d.textContent = text;   // textContent => no HTML injection
   chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
+  return d;
 }
 function setBusy(b) { busy = b; sendBtn.disabled = b; input.disabled = b; if (!b) input.focus(); }
 
-function render(data) {
-  const replies = data.replies || [], events = data.events || [];
-  // kitchen events happen after "sending to the kitchen" and before the final message
-  const head = events.length ? replies.slice(0, -1) : replies;
-  const tail = events.length ? replies.slice(-1) : [];
-  head.forEach(r => add("msg ai", r));
-  events.forEach(e => add("event " + (/failed/i.test(e) ? "bad" : "good"), e));
-  tail.forEach(r => add("msg ai", r));
-  document.getElementById("st").textContent = data.status;
-  document.getElementById("r-order").textContent = data.retries.order;
-  document.getElementById("r-cook").textContent = data.retries.cook;
-  document.getElementById("r-serve").textContent = data.retries.serve;
-  if (data.done) {
-    const ok = data.final_result === "COMPLETED";
+// types an AI message word by word
+async function typeMessage(text) {
+  const el = add("msg ai", "");
+  const words = text.split(" ");
+  for (let i = 0; i < words.length; i++) {
+    el.textContent += (i ? " " : "") + words[i];
+    chat.scrollTop = chat.scrollHeight;
+    await sleep(35);
+  }
+}
+
+function showState(st) {
+  document.getElementById("st").textContent = st.status;
+  document.getElementById("r-order").textContent = st.retries.order;
+  document.getElementById("r-cook").textContent = st.retries.cook;
+  document.getElementById("r-serve").textContent = st.retries.serve;
+  if (st.done) {
+    const ok = st.final_result === "COMPLETED";
     add("result " + (ok ? "ok" : "fail"), ok ? "Order completed" : "Order failed");
     input.disabled = true; sendBtn.disabled = true;
   }
 }
 
-async function api(path, body) {
+// splits the buffered stream text into complete SSE events; returns [events, leftover]
+function parseSSE(buf) {
+  const events = [];
+  let i;
+  while ((i = buf.indexOf("\n\n")) >= 0) {
+    const block = buf.slice(0, i); buf = buf.slice(i + 2);
+    let name = "message", data = "";
+    for (const line of block.split("\n")) {
+      if (line.startsWith("event: ")) name = line.slice(7);
+      else if (line.startsWith("data: ")) data += line.slice(6);
+    }
+    if (data) events.push({ name, data: JSON.parse(data) });
+  }
+  return [events, buf];
+}
+
+function handleEvent(ev) {
+  if (ev.name === "session") sessionId = ev.data.session_id;
+  else if (ev.name === "reply") enqueue(() => typeMessage(ev.data.text));
+  else if (ev.name === "event") enqueue(() => { add("event " + (/failed/i.test(ev.data.text) ? "bad" : "good"), ev.data.text); return sleep(150); });
+  else if (ev.name === "state") enqueue(() => showState(ev.data));
+  else if (ev.name === "error") enqueue(() => add("event bad", "Error: " + ev.data.detail));
+}
+
+async function streamCall(path, body) {
   const res = await fetch(API + path, {
-    method: body ? "POST" : "GET",
-    headers: body ? { "Content-Type": "application/json" } : {},
-    body: body ? JSON.stringify(body) : undefined,
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body || {}),
   });
   if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || res.statusText); }
-  return res.json();
+  const reader = res.body.getReader(), dec = new TextDecoder();
+  let buf = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buf += dec.decode(value, { stream: true });
+    const [events, rest] = parseSSE(buf); buf = rest;
+    events.forEach(handleEvent);
+  }
+  await queue;   // wait until everything has been displayed
 }
 
 async function startOrder() {
-  chat.innerHTML = ""; setBusy(true);
-  try {
-    const data = await api("/api/start", {});
-    sessionId = data.session_id; render(data);
-  } catch (e) {
-    add("event bad", "Could not reach the server (it may be waking up - wait 30s and click New order). " + e.message);
-  }
-  setBusy(false);
+  chat.innerHTML = ""; setBusy(true); sessionId = null; queue = Promise.resolve();
+  try { await streamCall("/api/start/stream"); }
+  catch (e) { add("event bad", "Could not reach the server (it may be waking up - wait 30s and click New order). " + e.message); }
+  if (!document.querySelector(".result")) setBusy(false);   // finished orders stay locked until "New order"
 }
 
 form.addEventListener("submit", async (ev) => {
@@ -111,7 +148,7 @@ form.addEventListener("submit", async (ev) => {
   const text = input.value.trim();
   if (!text || busy || !sessionId) return;
   input.value = ""; add("msg user", text); setBusy(true);
-  try { render(await api("/api/chat", { session_id: sessionId, message: text })); }
+  try { await streamCall("/api/chat/stream", { session_id: sessionId, message: text }); }
   catch (e) { add("event bad", "Error: " + e.message); }
   if (!document.querySelector(".result")) setBusy(false);
 });
@@ -119,7 +156,8 @@ document.getElementById("newBtn").addEventListener("click", startOrder);
 
 (async () => {
   try {
-    const m = (await api("/api/menu")).menu;
+    const res = await fetch(API + "/api/menu");
+    const m = (await res.json()).menu;
     document.getElementById("menuPanel").innerHTML =
       "<b>Menu:</b> " + Object.entries(m).map(([d, q]) => `${d} (${q} left)`).join(" | ");
   } catch { document.getElementById("menuPanel").textContent = "Menu unavailable"; }
