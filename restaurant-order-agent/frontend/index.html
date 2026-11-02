@@ -1,0 +1,132 @@
+@'
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Restaurant Order Agent</title>
+<style>
+  :root { --bg:#f6f6f4; --card:#fff; --text:#1f1f1d; --muted:#6b6b66; --accent:#c2410c; --user:#c2410c; --ai:#efeeea; --border:#e2e1dc; --ok:#15803d; --bad:#b91c1c; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161615; --card:#1f1f1d; --text:#ecebe6; --muted:#9a9993; --accent:#f97316; --user:#c2410c; --ai:#2a2a27; --border:#33332f; --ok:#4ade80; --bad:#f87171; }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { font-family: system-ui, -apple-system, Segoe UI, sans-serif; background: var(--bg); color: var(--text); display:flex; justify-content:center; }
+  .app { width:100%; max-width:760px; height:100%; display:flex; flex-direction:column; padding:12px; gap:10px; }
+  header { display:flex; justify-content:space-between; align-items:center; gap:8px; flex-wrap:wrap; }
+  h1 { font-size:1.1rem; margin:0; }
+  button { font:inherit; cursor:pointer; border:1px solid var(--border); background:var(--card); color:var(--text); border-radius:8px; padding:6px 12px; }
+  button.primary { background:var(--accent); border-color:var(--accent); color:#fff; }
+  button:disabled { opacity:.5; cursor:not-allowed; }
+  .panel { background:var(--card); border:1px solid var(--border); border-radius:12px; padding:8px 12px; font-size:.85rem; color:var(--muted); display:flex; flex-wrap:wrap; gap:6px 16px; }
+  .panel b { color:var(--text); }
+  #chat { flex:1; overflow-y:auto; display:flex; flex-direction:column; gap:8px; padding:4px 2px; }
+  .msg { max-width:85%; padding:9px 13px; border-radius:14px; line-height:1.4; white-space:pre-wrap; word-wrap:break-word; }
+  .ai { background:var(--ai); align-self:flex-start; border-bottom-left-radius:4px; }
+  .user { background:var(--user); color:#fff; align-self:flex-end; border-bottom-right-radius:4px; }
+  .event { align-self:center; font-size:.8rem; color:var(--muted); background:var(--card); border:1px dashed var(--border); border-radius:999px; padding:3px 12px; }
+  .event.bad { color:var(--bad); } .event.good { color:var(--ok); }
+  .result { align-self:center; font-weight:600; padding:6px 16px; border-radius:999px; border:1px solid currentColor; }
+  .result.ok { color:var(--ok); } .result.fail { color:var(--bad); }
+  form { display:flex; gap:8px; }
+  input { flex:1; font:inherit; padding:10px 12px; border-radius:10px; border:1px solid var(--border); background:var(--card); color:var(--text); }
+  input:focus { outline:2px solid var(--accent); }
+</style>
+</head>
+<body>
+<div class="app">
+  <header>
+    <h1>Restaurant Order Agent</h1>
+    <button id="newBtn">New order</button>
+  </header>
+  <div class="panel" id="menuPanel">Loading menu...</div>
+  <div class="panel" id="statusPanel">
+    <span>Status: <b id="st">-</b></span>
+    <span>Order attempts left: <b id="r-order">3</b></span>
+    <span>Cook retries left: <b id="r-cook">2</b></span>
+    <span>Serve retries left: <b id="r-serve">2</b></span>
+  </div>
+  <div id="chat" aria-live="polite"></div>
+  <form id="form">
+    <input id="input" autocomplete="off" maxlength="300" placeholder="e.g. I want 2 burgers" />
+    <button class="primary" id="send">Send</button>
+  </form>
+</div>
+<script src="config.js"></script>
+<script>
+const API = (window.API_URL || "").replace(/\/$/, "");
+const chat = document.getElementById("chat"), input = document.getElementById("input"),
+      sendBtn = document.getElementById("send"), form = document.getElementById("form");
+let sessionId = null, busy = false;
+
+function add(cls, text) {
+  const d = document.createElement("div");
+  d.className = cls; d.textContent = text;   // textContent => no HTML injection
+  chat.appendChild(d); chat.scrollTop = chat.scrollHeight;
+}
+function setBusy(b) { busy = b; sendBtn.disabled = b; input.disabled = b; if (!b) input.focus(); }
+
+function render(data) {
+  const replies = data.replies || [], events = data.events || [];
+  // kitchen events happen after "sending to the kitchen" and before the final message
+  const head = events.length ? replies.slice(0, -1) : replies;
+  const tail = events.length ? replies.slice(-1) : [];
+  head.forEach(r => add("msg ai", r));
+  events.forEach(e => add("event " + (/failed/i.test(e) ? "bad" : "good"), e));
+  tail.forEach(r => add("msg ai", r));
+  document.getElementById("st").textContent = data.status;
+  document.getElementById("r-order").textContent = data.retries.order;
+  document.getElementById("r-cook").textContent = data.retries.cook;
+  document.getElementById("r-serve").textContent = data.retries.serve;
+  if (data.done) {
+    const ok = data.final_result === "COMPLETED";
+    add("result " + (ok ? "ok" : "fail"), ok ? "Order completed" : "Order failed");
+    input.disabled = true; sendBtn.disabled = true;
+  }
+}
+
+async function api(path, body) {
+  const res = await fetch(API + path, {
+    method: body ? "POST" : "GET",
+    headers: body ? { "Content-Type": "application/json" } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  });
+  if (!res.ok) { const e = await res.json().catch(() => ({})); throw new Error(e.detail || res.statusText); }
+  return res.json();
+}
+
+async function startOrder() {
+  chat.innerHTML = ""; setBusy(true);
+  try {
+    const data = await api("/api/start", {});
+    sessionId = data.session_id; render(data);
+  } catch (e) {
+    add("event bad", "Could not reach the server (it may be waking up - wait 30s and click New order). " + e.message);
+  }
+  setBusy(false);
+}
+
+form.addEventListener("submit", async (ev) => {
+  ev.preventDefault();
+  const text = input.value.trim();
+  if (!text || busy || !sessionId) return;
+  input.value = ""; add("msg user", text); setBusy(true);
+  try { render(await api("/api/chat", { session_id: sessionId, message: text })); }
+  catch (e) { add("event bad", "Error: " + e.message); }
+  if (!document.querySelector(".result")) setBusy(false);
+});
+document.getElementById("newBtn").addEventListener("click", startOrder);
+
+(async () => {
+  try {
+    const m = (await api("/api/menu")).menu;
+    document.getElementById("menuPanel").innerHTML =
+      "<b>Menu:</b> " + Object.entries(m).map(([d, q]) => `${d} (${q} left)`).join(" | ");
+  } catch { document.getElementById("menuPanel").textContent = "Menu unavailable"; }
+  startOrder();
+})();
+</script>
+</body>
+</html>
+'@ | Set-Content -Path index.html -Encoding utf8
